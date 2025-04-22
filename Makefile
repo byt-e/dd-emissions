@@ -1,6 +1,6 @@
-CC=gcc
-CFLAGS=-Wall -Wextra -pedantic -std=c99
-LIBS=-lcurl -ljansson
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c99 -Iinclude
+LIBS = -lcurl -ljansson
 
 all: ddfetch
 

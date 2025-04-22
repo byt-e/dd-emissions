@@ -3,18 +3,28 @@
 #include <string.h>
 #include <curl/curl.h>
 #include <jansson.h>
+#include "uthash.h"
 
 struct MemoryBuffer {
     char *data;
     size_t size;
 };
 
+typedef struct EmissionEntry {
+    char date[11]; // YYYY-MM-DD + null terminator
+    double gold;
+    int nft_count;
+    UT_hash_handle hh;
+} EmissionEntry;
+
 size_t write_data(void *buffer, size_t size, size_t nmemb, void *userp);
 char *build_url(const char *wallet_id);
 CURL *init_curl(const char *url, struct MemoryBuffer *buffer);
 json_t *parse_json_response(const char *data);
 int extract_nft_count(json_t *root);
-int write_emissions_to_file(json_t *root, int nft_count, const char *filename);
+int write_emissions_to_file(EmissionEntry *emissions, const char *filename);
+EmissionEntry *load_existing_emissions(const char *filename);
+EmissionEntry *merge_emissions(EmissionEntry *emissions, json_t *root, int nft_count);
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -53,11 +63,20 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (write_emissions_to_file(root, nft_count, "emissions.txt") != 0) {
+    EmissionEntry *emissions = load_existing_emissions("emissions.txt");
+    emissions = merge_emissions(emissions, root, nft_count);
+
+    if (write_emissions_to_file(emissions, "emissions.txt") != 0) {
         return EXIT_FAILURE;
     }
 
     curl_easy_cleanup(curl);
+
+    EmissionEntry *e, *tmp;
+    HASH_ITER(hh, emissions, e, tmp) {
+        HASH_DEL(emissions, e);
+        free(e);
+    }
 
     return EXIT_SUCCESS;
 }
@@ -107,7 +126,7 @@ char *build_url(const char *wallet_id) {
  * init_curl() constructs a curl handle with the relevant fields for 
  * processing the HTTP request and parsing the response into the
  * provided memory buffer.
-*/
+ */
 CURL *init_curl(const char *wallet_id, struct MemoryBuffer *buffer) {
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -132,10 +151,10 @@ CURL *init_curl(const char *wallet_id, struct MemoryBuffer *buffer) {
 }
 
 /*
-* parse_json_response() takes a raw JSON string and attempts to 
-* parse it using Jansson. If parsing fails, it returns NULL back 
-* to the caller.
-*/
+ * parse_json_response() takes a raw JSON string and attempts to 
+ * parse it using Jansson. If parsing fails, it returns NULL back 
+ * to the caller.
+ */
 json_t *parse_json_response(const char *data) {
     json_error_t error;
     json_t *root = json_loads(data, 0, &error);
@@ -152,7 +171,7 @@ json_t *parse_json_response(const char *data) {
  * extract_nft_count() takes in a root JSON node and searches the
  * tree for the expected nfts object, and extracts out the nft
  * count, failing and returning -1 if neither are present.
-*/
+ */
 int extract_nft_count(json_t *root) {
     json_t *nfts = json_object_get(root, "nfts");
     if (!json_is_object(nfts)) {
@@ -170,30 +189,101 @@ int extract_nft_count(json_t *root) {
 }
 
 /*
+ * sort_by_date() is used to sort the hash entries into ascending
+ * order by date, useful to use before writing out to the file.
+ */
+int sort_by_date(const EmissionEntry *a, const EmissionEntry *b) {
+    return strcmp(a->date, b->date);
+}
+
+/*
  * write_emissions_to_file() parses the root object for dailyEmissions and
  * attempts to write the relevant values down to the provided filename, it 
  * will return -1 if an error occurs at any stage.
  * file format: date value nft_count
  */
-int write_emissions_to_file(json_t *root, int nft_count, const char *filename) {
-    json_t *daily_emissions = json_object_get(root, "dailyEmissions");
-    if (!json_is_object(daily_emissions)) {
-        fprintf(stderr, "daily_emissions was not an object, cannot parse\n");
-        return -1;
-    }
-
+int write_emissions_to_file(EmissionEntry *emissions, const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) {
         perror("fopen");
         return -1;
     }
 
-    fprintf(fp, "date value nft_count\n");
+    HASH_SORT(emissions, sort_by_date);
 
-    const char *key;
+    EmissionEntry *entry, *tmp;
+    HASH_ITER(hh, emissions, entry, tmp) {
+        fprintf(fp, "%s %.2f %d\n", entry->date, entry->gold, entry->nft_count);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+/*
+ * load_existing_emissions() attempts to load the data within a  
+ * provided filename into the EmissionEntry hash table, if it 
+ * is unable to read the file, or deal with parsing the file 
+ * then NULL is returned.
+ */
+EmissionEntry *load_existing_emissions(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        // File may not exist (first run), treat as empty.
+        return NULL;
+    }
+
+    EmissionEntry *emissions = NULL;
+
+    char line[128];
+
+    // Skip the header row.
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return NULL;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char date[11];
+        double gold;
+        int nft_count;
+
+        int matched = sscanf(line, "%10s %lf %d", date, &gold, &nft_count);
+        if (matched != 3) {
+            fprintf(stderr, "skipping malformed line: %s", line);
+            continue;
+        }
+
+        EmissionEntry *entry = malloc(sizeof(EmissionEntry));
+        if (!entry) {
+            perror("malloc");
+            fclose(fp);
+            return NULL;
+        }
+
+        strncpy(entry->date, date, 11);
+        entry->gold = gold;
+        entry->nft_count = nft_count;
+
+        HASH_ADD_STR(emissions, date, entry);
+    }
+
+    fclose(fp);
+
+    return emissions;
+}
+
+EmissionEntry *merge_emissions(EmissionEntry *emissions, json_t *root, int nft_count) {
+    json_t *daily_emissions = json_object_get(root, "dailyEmissions");
+    if (!json_is_object(daily_emissions)) {
+        fprintf(stderr, "daily_emissions was not an object, cannot parse\n");
+        return NULL;
+    }
+
+    const char *date; 
     json_t *value;
 
-    json_object_foreach(daily_emissions, key, value) {
+    json_object_foreach(daily_emissions, date, value) {
         double gold = 0.0;
 
         if (json_is_real(value)) {
@@ -201,14 +291,37 @@ int write_emissions_to_file(json_t *root, int nft_count, const char *filename) {
         } else if (json_is_integer(value)) {
             gold = (double) json_integer_value(value);
         } else {
-            fprintf(stderr, "unexpected value type for key %s\n", key);
+            fprintf(stderr, "unexpected value type for key %s\n", date);
             continue;
         }
 
-        fprintf(fp, "%s %.2f %d\n", key, gold, nft_count);
+        EmissionEntry *entry;
+        HASH_FIND_STR(emissions, date, entry);
+
+        // New Entry, create and store.
+        if (!entry) {
+            entry = malloc(sizeof(EmissionEntry));
+            if (!entry) {
+                perror("malloc");
+                continue;
+            }
+
+            strncpy(entry->date, date, 11);
+            entry->gold = gold;
+            entry->nft_count = nft_count;
+
+            HASH_ADD_STR(emissions, date, entry);
+            continue;
+        }
+
+        if (gold > entry->gold) {
+            entry->gold = gold;
+        }
+
+        if (nft_count > entry->nft_count) {
+            entry->nft_count = nft_count;
+        }
     }
 
-    fclose(fp);
-
-    return 0;
+    return emissions;
 }
