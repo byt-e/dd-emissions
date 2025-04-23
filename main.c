@@ -5,6 +5,8 @@
 #include <jansson.h>
 #include "uthash.h"
 
+#define IS_ZERO(x) ((x) < 0.000001 && (x) > -0.000001)
+
 struct MemoryBuffer {
     char *data;
     size_t size;
@@ -14,6 +16,7 @@ typedef struct EmissionEntry {
     char date[11]; // YYYY-MM-DD + null terminator
     double gold;
     int nft_count;
+    double gold_price;
     UT_hash_handle hh;
 } EmissionEntry;
 
@@ -211,9 +214,18 @@ int write_emissions_to_file(EmissionEntry *emissions, const char *filename) {
 
     HASH_SORT(emissions, sort_by_date);
 
+    // Header row.
+    fprintf(fp, "date gold nft_count gold_price previous_usd_value\n");
+
     EmissionEntry *entry, *tmp;
     HASH_ITER(hh, emissions, entry, tmp) {
-        fprintf(fp, "%s %.2f %d\n", entry->date, entry->gold, entry->nft_count);
+        fprintf(fp, "%s %.2f %d %.5f %.5f\n", 
+            entry->date, 
+            entry->gold, 
+            entry->nft_count,
+            entry->gold_price,
+            entry->gold * entry->gold_price
+        );
     }
 
     fclose(fp);
@@ -247,9 +259,10 @@ EmissionEntry *load_existing_emissions(const char *filename) {
         char date[11];
         double gold;
         int nft_count;
+        double gold_price;
 
-        int matched = sscanf(line, "%10s %lf %d", date, &gold, &nft_count);
-        if (matched != 3) {
+        int matched = sscanf(line, "%10s %lf %d %lf", date, &gold, &nft_count, &gold_price);
+        if (matched != 4) {
             fprintf(stderr, "skipping malformed line: %s", line);
             continue;
         }
@@ -264,6 +277,7 @@ EmissionEntry *load_existing_emissions(const char *filename) {
         strncpy(entry->date, date, 11);
         entry->gold = gold;
         entry->nft_count = nft_count;
+        entry->gold_price = gold_price;
 
         HASH_ADD_STR(emissions, date, entry);
     }
@@ -283,6 +297,17 @@ EmissionEntry *merge_emissions(EmissionEntry *emissions, json_t *root, int nft_c
     const char *date; 
     json_t *value;
 
+    json_t *price_obj = json_object_get(root, "goldPrice");
+    double gold_price = 0.0;
+
+    if (json_is_real(price_obj)) {
+        gold_price = json_real_value(price_obj);
+    } else if (json_is_integer(price_obj)) {
+        gold_price = (double) json_integer_value(price_obj);
+    } else {
+        fprintf(stderr, "missing or invalid goldPrice\n");
+    }
+
     json_object_foreach(daily_emissions, date, value) {
         double gold = 0.0;
 
@@ -298,8 +323,8 @@ EmissionEntry *merge_emissions(EmissionEntry *emissions, json_t *root, int nft_c
         EmissionEntry *entry;
         HASH_FIND_STR(emissions, date, entry);
 
-        // New Entry, create and store.
         if (!entry) {
+            // New Entry, create and store.
             entry = malloc(sizeof(EmissionEntry));
             if (!entry) {
                 perror("malloc");
@@ -309,17 +334,22 @@ EmissionEntry *merge_emissions(EmissionEntry *emissions, json_t *root, int nft_c
             strncpy(entry->date, date, 11);
             entry->gold = gold;
             entry->nft_count = nft_count;
+            entry->gold_price = gold_price;
 
             HASH_ADD_STR(emissions, date, entry);
-            continue;
-        }
+        } else {
+            // Update Existing Entry.
+            if (gold > entry->gold) {
+                entry->gold = gold;
+            }
 
-        if (gold > entry->gold) {
-            entry->gold = gold;
-        }
+            if (IS_ZERO(entry->gold_price) && gold_price > 0.0) {
+                entry->gold_price = gold_price;
+            }
 
-        if (nft_count > entry->nft_count) {
-            entry->nft_count = nft_count;
+            if (nft_count > entry->nft_count) {
+                entry->nft_count = nft_count;
+            }
         }
     }
 
